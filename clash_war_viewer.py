@@ -46,6 +46,28 @@ STATE_CN = {
     "ended": "已结束",
 }
 
+ROLE_CN = {
+    "leader": "首领",
+    "coLeader": "副首领",
+    "admin": "长老",
+    "elder": "长老",
+    "member": "成员",
+}
+
+CAPITAL_STATE_CN = {
+    "ongoing": "进行中",
+    "inProgress": "进行中",
+    "ended": "已结束",
+}
+
+# 活跃度档位(天): 关注 / 警告 / 严重
+ACTIVITY_WARN_DAYS = 7
+ACTIVITY_ALERT_DAYS = 14
+ACTIVITY_SEVERE_DAYS = 30
+
+# 活跃度快照的自动记录间隔(秒): 自动刷新时最多每 5 分钟记录一次
+SNAPSHOT_MIN_INTERVAL = 300
+
 
 # ---------------------------------------------------------------- 工具函数
 
@@ -55,14 +77,102 @@ def resource_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def config_file():
+def data_dir():
     base = os.environ.get("APPDATA") or resource_dir()
     d = os.path.join(base, APP_NAME)
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
         d = resource_dir()
-    return os.path.join(d, "config.json")
+    return d
+
+
+def config_file():
+    return os.path.join(data_dir(), "config.json")
+
+
+def activity_file():
+    return os.path.join(data_dir(), "activity.json")
+
+
+def load_activity():
+    """本地活跃度数据: {"members": {tag: {...}}, "whitelist": [tag, ...]}"""
+    try:
+        with open(activity_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("members", {})
+            data.setdefault("whitelist", [])
+            return data
+    except Exception:
+        pass
+    return {"members": {}, "whitelist": []}
+
+
+def save_activity(data):
+    try:
+        with open(activity_file(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 都城突袭历史
+# 官方 API 只对最新一次突袭返回成员明细, 历史赛季成员为空;
+# 因此每次突袭期间查询时, 把成员刀数快照存到本地, 下次即可对比"上次"。
+
+CAPITAL_HISTORY_MAX = 8
+
+
+def capital_history_file():
+    return os.path.join(data_dir(), "capital_history.json")
+
+
+def load_capital_history():
+    """{"seasons": {startTime: {start, end, members: {tag: {name, attacks, limit}}}}}"""
+    try:
+        with open(capital_history_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("seasons"), dict):
+            return data
+    except Exception:
+        pass
+    return {"seasons": {}}
+
+
+def save_capital_history(data):
+    try:
+        with open(capital_history_file(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def update_capital_history(season):
+    """把一次突袭的成员刀数写入本地历史(覆盖同一赛季, 保留最新快照)"""
+    members = season.get("members") or []
+    key = str(season.get("startTime") or season.get("endTime") or "")
+    if not key or not members:
+        return load_capital_history()
+    hist = load_capital_history()
+    entry = hist["seasons"].setdefault(key, {})
+    entry["start"] = season.get("startTime")
+    entry["end"] = season.get("endTime")
+    mem = entry.setdefault("members", {})
+    for m in members:
+        tag = clean_tag(m.get("tag", ""))
+        if not tag:
+            continue
+        mem[tag] = {
+            "name": m.get("name"),
+            "attacks": int(m.get("attacks") or 0),
+            "limit": int(m.get("attackLimit") or 0) + int(m.get("bonusAttackLimit") or 0),
+        }
+    keys = sorted(hist["seasons"].keys(), reverse=True)
+    for k in keys[CAPITAL_HISTORY_MAX:]:
+        hist["seasons"].pop(k, None)
+    save_capital_history(hist)
+    return hist
 
 
 def load_config():
@@ -91,6 +201,81 @@ def clean_tag(tag):
 
 def url_tag(tag):
     return urllib.parse.quote("#" + clean_tag(tag), safe="")
+
+
+def update_snapshots(members, activity, war=None, now=None, side_tag=None):
+    """用一次成员列表(以及可选的战争数据)更新本地活跃度快照。
+
+    活跃判定(近似):
+      - 捐兵/收兵数量增加(每周清零导致的减少不算)
+      - 经验等级、大本等级变化
+      - 同一场部落战中进攻次数增加
+    返回更新后的 activity。"""
+    now = now or time.time()
+    old = activity.get("members") or {}
+    new = {}
+    war_key = ""
+    war_attacks = {}
+    if war and war.get("state") in ("preparation", "inWar", "warEnded"):
+        war_key = str(war.get("preparationStartTime") or war.get("startTime") or "")
+        clan = war.get("clan") or {}
+        opp = war.get("opponent") or {}
+        side = clan
+        if side_tag:
+            st = clean_tag(side_tag)
+            if clean_tag(opp.get("tag", "")) == st and clean_tag(clan.get("tag", "")) != st:
+                side = opp
+        for m in side.get("members") or []:
+            t = clean_tag(m.get("tag", ""))
+            if t:
+                war_attacks[t] = len(m.get("attacks") or [])
+
+    for m in members or []:
+        tag = clean_tag(m.get("tag", ""))
+        if not tag:
+            continue
+        fp = {k: m.get(k) for k in ("donations", "donationsReceived", "expLevel", "townHallLevel")}
+        rec = old.get(tag)
+        if not isinstance(rec, dict):
+            rec = {"last_change": now, "values": fp, "first_seen": now}
+        else:
+            prev = rec.get("values") or {}
+            changed = False
+            for k, v in fp.items():
+                pv = prev.get(k)
+                if v is None or pv is None:
+                    if v != pv:
+                        changed = True
+                    continue
+                if k in ("donations", "donationsReceived"):
+                    if v > pv:          # 每周清零(减少)不算活跃
+                        changed = True
+                elif v != pv:
+                    changed = True
+            rec["values"] = fp
+
+            if war_attacks and tag in war_attacks:
+                cnt = war_attacks[tag]
+                prev_war = rec.get("war") or {}
+                if prev_war.get("key") == war_key:
+                    if cnt > int(prev_war.get("count") or 0):
+                        changed = True
+                rec["war"] = {"key": war_key, "count": cnt}
+
+            if changed:
+                rec["last_change"] = now
+
+        rec["name"] = m.get("name")
+        rec["role"] = m.get("role")
+        rec["th"] = m.get("townHallLevel")
+        rec["trophies"] = m.get("trophies")
+        rec["donations"] = m.get("donations")
+        rec.setdefault("first_seen", now)
+        rec["last_checked"] = now
+        new[tag] = rec
+
+    activity["members"] = new
+    return activity
 
 
 def api_get(path, token, retries=3):
@@ -153,6 +338,14 @@ def fmt_date(s):
         return dt.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return s or "-"
+
+
+def fmt_ts_local(ts):
+    """Unix 时间戳 -> 本地时间字符串"""
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
 
 
 def fmt_dur(sec):
@@ -255,8 +448,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("部落冲突(国际服) 部落战成员战斗情况查看器")
-        root.geometry("1180x680")
-        root.minsize(1000, 560)
+        root.geometry("1360x700")
+        root.minsize(1080, 580)
         try:
             if getattr(sys, "frozen", False):
                 root.iconbitmap(default=sys.executable)
@@ -279,6 +472,14 @@ class App:
         self.paused = False          # 是否暂停自动刷新
         self.auto_refresh_job = None # 自动刷新的 after 任务 id
         self.refresh_interval = 30000  # 自动刷新间隔(毫秒) = 30秒
+        self.activity_data = load_activity()   # 本地活跃度快照
+        self.activity_win = None               # 活跃度窗口
+        self._last_snapshot_ts = 0.0           # 上次记录快照的时间
+        self.capital_win = None                # 都城窗口
+        self.capital_seasons = []              # 都城赛季数据
+        self.capital_sel = None
+        self.capital_table = None
+        self.capital_summary = None
 
         self.build_ui()
         self.render()
@@ -310,13 +511,15 @@ class App:
             ("查询当前部落战", self.query_current),
             ("部落联赛CWL", self.query_cwl),
             ("战争日志", self.query_warlog),
+            ("部落都城", self.query_capital),
+            ("活跃度", self.open_activity),
             ("刷新", self.refresh),
             ("暂停刷新", self.toggle_pause),
             ("导出CSV", self.export_csv),
             ("帮助", self.show_help),
         ):
             b = ttk.Button(top, text=text, command=cmd)
-            b.pack(side="left", padx=3)
+            b.pack(side="left", padx=2)
             self.buttons.append(b)
             if text == "暂停刷新":
                 self.pause_btn = b
@@ -324,7 +527,7 @@ class App:
         help_text = ("令牌获取: developer.clashofclans.com → 用谷歌账号等登录 → Create Key → "
                      "填写你电脑的公网IP → 勾选 Clash of Clans → 复制令牌粘贴到这里。"
                      "标签示例: #2LJQ2YVY (带#或不带均可)。")
-        ttk.Label(root, text=help_text, foreground="#666666", wraplength=1160,
+        ttk.Label(root, text=help_text, foreground="#666666", wraplength=1340,
                   justify="left").pack(fill="x", padx=10, pady=(0, 4))
 
         sel = ttk.Frame(root, padding=(10, 0, 10, 4))
@@ -556,8 +759,10 @@ class App:
                     self.show_notice("当前没有进行中的部落战。\n若现在是联赛期间,请点击“部落联赛CWL”查看联赛。",
                                      dialog=not silent)
                 self.post(empty)
-                return
-            self.post(lambda w=war: self.show_wars([w]))
+            else:
+                self.post(lambda w=war: self.show_wars([w]))
+            # 记录活跃度快照(自动刷新时每5分钟最多一次, 手动查询立即记录)
+            self.try_snapshot(tag, token, war, silent)
 
         self.run_async(work)
 
@@ -570,6 +775,7 @@ class App:
         self.save_inputs()
 
         def work():
+            self.try_snapshot(tag, token, None, silent)
             try:
                 lg = api_get("/clans/%s/currentwar/leaguegroup" % url_tag(tag), token)
             except urllib.error.HTTPError as e:
@@ -672,6 +878,8 @@ class App:
             self.query_cwl()
         elif self.last_mode == "warlog":
             self.query_warlog()
+        elif self.last_mode == "capital":
+            self.query_capital()
         else:
             messagebox.showinfo("提示", "尚未查询过,请先点击查询按钮。")
 
@@ -752,6 +960,423 @@ class App:
                 fmt_pct(me.get("destructionPercentage")),
                 fmt_pct(other.get("destructionPercentage")),
             ))
+
+    # ------------------------------------------------ 成员活跃度(离线追踪)
+
+    def try_snapshot(self, tag, token, war=None, silent=False):
+        """后台线程中记录一次成员活跃度快照(失败不影响主流程)"""
+        now = time.time()
+        if silent and now - self._last_snapshot_ts < SNAPSHOT_MIN_INTERVAL:
+            return
+        try:
+            ms = api_get("/clans/%s/members?limit=50" % url_tag(tag), token)
+            act = load_activity()
+            update_snapshots(ms.get("items") or [], act, war=war, side_tag=tag)
+            save_activity(act)
+            self._last_snapshot_ts = time.time()
+            self.post(lambda a=act: self.apply_activity(a))
+        except Exception:
+            pass
+
+    def apply_activity(self, act):
+        self.activity_data = act
+        self.render_activity()
+
+    def open_activity(self):
+        if self.activity_win is not None and self.activity_win.winfo_exists():
+            self.activity_win.lift()
+            self.activity_win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("成员活跃度(离线追踪)")
+        win.geometry("1000x560")
+        win.minsize(860, 440)
+        self.activity_win = win
+
+        note = ("说明: 官方API没有“最后在线时间”,这里根据成员数据变化(捐兵/收兵/等级/战争进攻次数)近似判断活跃度。\n"
+                "程序每次查询会自动记录快照(自动刷新时每5分钟最多一次);需要程序持续运行或定期打开才能积累历史。\n"
+                "无变化 ≥7天=关注, ≥14天=警告, ≥30天=严重;白名单成员不会被标记。")
+        ttk.Label(win, text=note, foreground="#666666",
+                  wraplength=960, justify="left").pack(anchor="w", padx=12, pady=(10, 2))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=(4, 6))
+        ttk.Button(bar, text="刷新快照", command=self.refresh_activity).pack(side="left", padx=3)
+        ttk.Button(bar, text="加入白名单", command=lambda: self.toggle_whitelist(True)).pack(side="left", padx=3)
+        ttk.Button(bar, text="移出白名单", command=lambda: self.toggle_whitelist(False)).pack(side="left", padx=3)
+        ttk.Button(bar, text="导出待处理名单", command=self.export_activity_csv).pack(side="left", padx=3)
+        ttk.Button(bar, text="关闭", command=win.destroy).pack(side="right", padx=3)
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        cols = ("name", "role", "th", "trophies", "donations", "last", "days", "status", "white")
+        heads = {"name": "成员", "role": "职位", "th": "大本", "trophies": "奖杯",
+                 "donations": "捐兵", "last": "上次变化", "days": "无变化天数",
+                 "status": "状态", "white": "白名单"}
+        widths = {"name": 160, "role": 70, "th": 55, "trophies": 70, "donations": 70,
+                  "last": 130, "days": 90, "status": 110, "white": 60}
+        self.act_table = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            self.act_table.heading(c, text=heads[c])
+            self.act_table.column(c, width=widths[c], anchor="center")
+        self.act_table.column("name", anchor="w")
+        ys = ttk.Scrollbar(frame, orient="vertical", command=self.act_table.yview)
+        self.act_table.configure(yscrollcommand=ys.set)
+        self.act_table.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+        for style, bg in (("warn", "#fdeecb"), ("alert", "#f8d3d3"),
+                          ("severe", "#e8a8a8"), ("white", "#eeeeee")):
+            self.act_table.tag_configure(style, background=bg)
+
+        self.render_activity()
+
+    def activity_status(self, tag, days, whitelist):
+        if tag in whitelist:
+            return "白名单", "white"
+        if days >= ACTIVITY_SEVERE_DAYS:
+            return "严重(≥30天)", "severe"
+        if days >= ACTIVITY_ALERT_DAYS:
+            return "警告(≥14天)", "alert"
+        if days >= ACTIVITY_WARN_DAYS:
+            return "关注(≥7天)", "warn"
+        return "正常", ""
+
+    def render_activity(self):
+        if self.activity_win is None or not self.activity_win.winfo_exists():
+            return
+        for iid in self.act_table.get_children():
+            self.act_table.delete(iid)
+        act = self.activity_data or {}
+        wl = set(act.get("whitelist") or [])
+        now = time.time()
+        rows = []
+        for tag, rec in (act.get("members") or {}).items():
+            days = max(0.0, (now - float(rec.get("last_change") or now)) / 86400.0)
+            status, style = self.activity_status(tag, days, wl)
+            rows.append((days, tag, rec, status, style))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        for days, tag, rec, status, style in rows:
+            self.act_table.insert("", "end", iid=tag, tags=(style,) if style else (), values=(
+                rec.get("name") or "?",
+                ROLE_CN.get(rec.get("role"), rec.get("role") or "-"),
+                rec.get("th") or "-",
+                rec.get("trophies") or 0,
+                rec.get("donations") or 0,
+                fmt_ts_local(rec.get("last_change")) if rec.get("last_change") else "-",
+                "%.1f" % days,
+                status,
+                "是" if tag in wl else "",
+            ))
+
+    def refresh_activity(self):
+        tag = clean_tag(self.tag_entry.get()) or self.clan_tag
+        token = self.token_entry.get().strip()
+        if not tag or not token:
+            messagebox.showwarning("提示", "请先在主窗口填写 API令牌 与 部落标签。")
+            return
+
+        def work():
+            try:
+                ms = api_get("/clans/%s/members?limit=50" % url_tag(tag), token)
+            except Exception as e:
+                msg = "获取成员列表失败:\n" + api_error_message(e)
+                self.post(lambda m=msg: self.show_error(m))
+                return
+            act = load_activity()
+            update_snapshots(ms.get("items") or [], act, now=time.time())
+            save_activity(act)
+            self._last_snapshot_ts = time.time()
+            self.post(lambda a=act: self.after_activity_refresh(a))
+
+        self.run_async(work)
+
+    def after_activity_refresh(self, act):
+        self.activity_data = act
+        self.render_activity()
+        self.set_status("活跃度快照已更新")
+
+    def toggle_whitelist(self, add):
+        if self.activity_win is None or not self.activity_win.winfo_exists():
+            return
+        sel = self.act_table.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中选中成员(可多选)。")
+            return
+        act = load_activity()
+        wl = set(act.get("whitelist") or [])
+        if add:
+            wl.update(sel)
+        else:
+            for t in sel:
+                wl.discard(t)
+        act["whitelist"] = sorted(wl)
+        save_activity(act)
+        self.activity_data = act
+        self.render_activity()
+
+    def export_activity_csv(self):
+        act = load_activity()
+        members = act.get("members") or {}
+        if not members:
+            messagebox.showinfo("提示", "还没有活跃度快照,请先查询部落战或点“刷新快照”。")
+            return
+        wl = set(act.get("whitelist") or [])
+        now = time.time()
+        todo = []
+        for tag, rec in members.items():
+            days = max(0.0, (now - float(rec.get("last_change") or now)) / 86400.0)
+            status, _ = self.activity_status(tag, days, wl)
+            if status not in ("白名单", "正常"):
+                todo.append((tag, rec, days, status))
+        todo.sort(key=lambda r: r[2], reverse=True)
+        if not todo:
+            messagebox.showinfo("提示", "目前没有达到7天无变化的成员。")
+            return
+        default = "coc_inactive_%s.csv" % time.strftime("%Y%m%d_%H%M")
+        path = filedialog.asksaveasfilename(title="导出待处理名单", defaultextension=".csv",
+                                            initialfile=default, filetypes=[("CSV文件", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                wr = csv.writer(f)
+                wr.writerow(["成员", "标签", "职位", "大本", "奖杯", "捐兵",
+                             "上次变化", "无变化天数", "状态"])
+                for tag, rec, days, status in todo:
+                    wr.writerow([rec.get("name") or "?", "#" + tag,
+                                 ROLE_CN.get(rec.get("role"), rec.get("role") or "-"),
+                                 rec.get("th") or "", rec.get("trophies") or "",
+                                 rec.get("donations") or "",
+                                 fmt_ts_local(rec.get("last_change")) if rec.get("last_change") else "",
+                                 "%.1f" % days, status])
+            messagebox.showinfo("成功", "已导出 %d 名待处理成员:\n%s" % (len(todo), path))
+        except Exception as e:
+            messagebox.showerror("错误", "导出失败: %s" % e)
+
+    # ------------------------------------------------ 部落都城(突袭周末)
+
+    def query_capital(self, silent=False):
+        tag, token = self.check_inputs()
+        if not tag:
+            return
+        self.clan_tag = tag
+        self.last_mode = "capital"
+        self.save_inputs()
+
+        def work():
+            try:
+                data = api_get("/clans/%s/capitalraidseasons" % url_tag(tag), token)
+            except Exception as e:
+                msg = "获取部落都城数据失败:\n" + api_error_message(e)
+                if silent:
+                    self.post(lambda m=msg: self.silent_error(m))
+                else:
+                    self.post(lambda m=msg: self.show_error(m))
+                return
+            items = data.get("items") or []
+            if items:
+                try:
+                    update_capital_history(items[0])
+                except Exception:
+                    pass
+            self.post(lambda: self.show_capital(items))
+
+        self.run_async(work)
+
+    def show_capital(self, items):
+        if not items:
+            messagebox.showinfo("提示", "该部落暂无都城突袭记录。")
+            return
+        if self.capital_win is not None and self.capital_win.winfo_exists():
+            self.capital_win.destroy()
+        win = tk.Toplevel(self.root)
+        win.title("部落都城(突袭周末)")
+        win.geometry("1000x580")
+        win.minsize(780, 440)
+        self.capital_win = win
+        self.capital_seasons = items
+
+        note = ("说明: 官方API只对“最新一次(进行中)突袭”返回成员明细,历史赛季只有团队汇总。\n"
+                "颜色规则: 两周都打满=绿色, 有一周没打满=黄色, 两周都没打满=红色。\n"
+                "“上次进攻”来自本地记录(每次突袭期间运行程序时自动保存, 需上次突袭期间打开过本程序)。")
+        ttk.Label(win, text=note, foreground="#666666", wraplength=960,
+                  justify="left").pack(anchor="w", padx=12, pady=(10, 2))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=(2, 4))
+        ttk.Label(bar, text="赛季:").pack(side="left")
+        labels = []
+        for s in items:
+            st = CAPITAL_STATE_CN.get(s.get("state"), s.get("state") or "-")
+            labels.append("%s ~ %s (%s)" % (fmt_cn_time(s.get("startTime")),
+                                            fmt_cn_time(s.get("endTime")), st))
+        self.capital_sel = ttk.Combobox(bar, values=labels, state="readonly", width=36)
+        self.capital_sel.pack(side="left", padx=(4, 10))
+        self.capital_sel.bind("<<ComboboxSelected>>", self.on_capital_select)
+        ttk.Button(bar, text="导出CSV", command=self.export_capital_csv).pack(side="left", padx=3)
+        ttk.Button(bar, text="关闭", command=win.destroy).pack(side="right", padx=3)
+
+        self.capital_summary = ttk.Label(win, text="", foreground="#0a58a0")
+        self.capital_summary.pack(anchor="w", padx=12, pady=(0, 2))
+        self.capital_hint = ttk.Label(win, text="", foreground="#b00020")
+        self.capital_hint.pack(anchor="w", padx=12, pady=(0, 4))
+
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        cols = ("name", "attacks", "limit", "pct", "prev", "two", "loot", "status")
+        heads = {"name": "成员", "attacks": "本次进攻", "limit": "攻击上限",
+                 "pct": "使用率", "prev": "上次进攻", "two": "两周情况",
+                 "loot": "首都资源", "status": "状态"}
+        widths = {"name": 170, "attacks": 85, "limit": 85, "pct": 75,
+                  "prev": 85, "two": 85, "loot": 110, "status": 85}
+        self.capital_table = ttk.Treeview(frame, columns=cols, show="headings")
+        for c in cols:
+            self.capital_table.heading(c, text=heads[c])
+            self.capital_table.column(c, width=widths[c], anchor="center")
+        self.capital_table.column("name", anchor="w")
+        ys = ttk.Scrollbar(frame, orient="vertical", command=self.capital_table.yview)
+        self.capital_table.configure(yscrollcommand=ys.set)
+        self.capital_table.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+        for style, bg in (("full", "#d6f2d6"), ("part", "#fdeecb"), ("zero", "#f8d3d3")):
+            self.capital_table.tag_configure(style, background=bg)
+
+        self.capital_sel.current(0)
+        self.render_capital(0)
+
+    def on_capital_select(self, event=None):
+        if self.capital_sel is None:
+            return
+        idx = self.capital_sel.current()
+        if idx >= 0:
+            self.render_capital(idx)
+
+    def capital_rows(self, season):
+        """计算某赛季成员的展示行(含上次刀数与两周评价)"""
+        members = season.get("members") or []
+        hist = load_capital_history()
+        cur_key = str(season.get("startTime") or "")
+        prev_keys = [k for k in (hist.get("seasons") or {}) if k < cur_key]
+        prev_members = ((hist["seasons"][max(prev_keys)] if prev_keys else {}) or {}).get("members") or {}
+        rows = []
+        for m in members:
+            a = int(m.get("attacks") or 0)
+            lim = int(m.get("attackLimit") or 0) + int(m.get("bonusAttackLimit") or 0)
+            cur_full = bool(lim) and a >= lim
+            pm = prev_members.get(clean_tag(m.get("tag", "")))
+            if pm:
+                p_att = int(pm.get("attacks") or 0)
+                p_lim = int(pm.get("limit") or 0)
+                p_full = bool(p_lim) and p_att >= p_lim
+                prev_text = str(p_att)
+                two = "%s/%s" % ("满" if p_full else "未", "满" if cur_full else "未")
+                if p_full and cur_full:
+                    style = "full"
+                elif p_full or cur_full:
+                    style = "part"
+                else:
+                    style = "zero"
+            else:
+                prev_text = "-"
+                two = "无/满" if cur_full else "无/未"
+                style = "full" if cur_full else "part"
+            if a <= 0:
+                status = "未进攻"
+            elif cur_full:
+                status = "打满"
+            else:
+                status = "未打满"
+            rows.append({
+                "name": m.get("name") or "?",
+                "tag": clean_tag(m.get("tag", "")),
+                "attacks": a,
+                "limit": lim,
+                "pct": ("%.0f%%" % (a * 100.0 / lim)) if lim else "-",
+                "prev": prev_text,
+                "two": two,
+                "loot": m.get("capitalResourcesLooted") or 0,
+                "status": status,
+                "style": style,
+            })
+        rows.sort(key=lambda r: r["attacks"], reverse=True)
+        return rows, bool(prev_members)
+
+    def render_capital(self, idx):
+        if not self.capital_seasons or idx < 0 or idx >= len(self.capital_seasons):
+            return
+        if self.capital_table is None or not self.capital_table.winfo_exists():
+            return
+        for iid in self.capital_table.get_children():
+            self.capital_table.delete(iid)
+        s = self.capital_seasons[idx]
+        members = s.get("members") or []
+        st = CAPITAL_STATE_CN.get(s.get("state"), s.get("state") or "-")
+
+        def num(v, default="-"):
+            return v if v is not None else default
+
+        summary = ("%s | 完成突袭 %s 次 | 团队资源 %s | 摧毁区域 %s | 成员 %d 人" % (
+            st, num(s.get("raidsCompleted")), num(s.get("capitalTotalLoot")),
+            num(s.get("enemyDistrictsDestroyed")), len(members)))
+        if members:
+            total_atk = sum(int(m.get("attacks") or 0) for m in members)
+            total_limit = sum(int(m.get("attackLimit") or 0) + int(m.get("bonusAttackLimit") or 0)
+                              for m in members)
+            summary += " | 全员进攻 %d/%d 次" % (total_atk, total_limit)
+        self.capital_summary.config(text=summary)
+
+        if not members:
+            self.capital_hint.config(text="该赛季暂无成员明细(官方API只提供最新一次突袭的成员数据)。")
+            return
+
+        rows, has_prev = self.capital_rows(s)
+        if has_prev:
+            self.capital_hint.config(text="")
+        else:
+            self.capital_hint.config(
+                text="未找到上一次突袭的本地记录(首次使用或上次突袭期间未运行程序),本次颜色按本周表现判断;"
+                     "下次突袭起将按两周情况判断。")
+
+        for r in rows:
+            iid = r.get("tag")
+            kwargs = {"tags": (r["style"],)}
+            if iid:
+                kwargs["iid"] = iid
+            self.capital_table.insert("", "end", values=(
+                r["name"], r["attacks"], r["limit"] or "-", r["pct"],
+                r["prev"], r["two"], r["loot"], r["status"],
+            ), **kwargs)
+
+    def export_capital_csv(self):
+        if not self.capital_seasons:
+            messagebox.showinfo("提示", "还没有都城数据,请先点击“部落都城”。")
+            return
+        idx = self.capital_sel.current() if self.capital_sel is not None else 0
+        if idx < 0:
+            idx = 0
+        s = self.capital_seasons[idx]
+        members = s.get("members") or []
+        if not members:
+            messagebox.showinfo("提示", "当前选中的赛季没有成员明细,无法导出。")
+            return
+        rows, _ = self.capital_rows(s)
+        default = "coc_capital_%s.csv" % time.strftime("%Y%m%d_%H%M")
+        path = filedialog.asksaveasfilename(title="导出都城成员数据", defaultextension=".csv",
+                                            initialfile=default, filetypes=[("CSV文件", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                wr = csv.writer(f)
+                wr.writerow(["成员", "标签", "本次进攻", "攻击上限", "使用率",
+                             "上次进攻", "两周情况", "首都资源", "状态"])
+                for r in rows:
+                    wr.writerow([r["name"], ("#" + r["tag"]) if r["tag"] else "",
+                                 r["attacks"], r["limit"] or "", r["pct"],
+                                 r["prev"], r["two"], r["loot"], r["status"]])
+            messagebox.showinfo("成功", "已导出:\n%s" % path)
+        except Exception as e:
+            messagebox.showerror("错误", "导出失败: %s" % e)
 
     def show_empty(self, msg=""):
         self.wars = []
@@ -930,8 +1555,18 @@ class App:
             "   - 绿色行 = 打出过3星, 橙色 = 1~2星, 红色 = 只打出0星, 灰色 = 还未进攻;\n"
             "   - 双击某一行可查看该成员每一次进攻与防守的明细;\n\n"
             "4. 点击\"部落联赛CWL\"可查看联赛每一轮或全部轮次的汇总;\n\n"
-            "5. 点击\"导出CSV\"把当前表格保存为Excel可打开的CSV文件。\n\n"
-            "6. 当前部落战视图每30秒自动刷新一次;\n"
+            "5. 点击\"部落都城\"查看突袭周末每位成员的进攻次数:\n"
+            "   - 攻击上限 = 基础次数 + 奖励次数(通常5+1=6次);\n"
+            "   - 颜色: 两周都打满=绿, 一周没满=黄, 两周都没满=红;\n"
+            "   - \"上次进攻\"来自本地记录(需上次突袭期间打开过本程序);\n"
+            "   - 官方API只提供最新一次突袭的成员明细;\n\n"
+            "6. 点击\"活跃度\"查看成员离线追踪:\n"
+            "   程序自动记录成员数据变化(捐兵/收兵/等级/战争进攻),\n"
+            "   无变化 ≥7天=关注, ≥14天=警告, ≥30天=严重;\n"
+            "   可把成员加入白名单豁免, 也可导出待处理名单。\n"
+            "   (官方API只读, 无法自动踢人, 请在游戏内操作)\n\n"
+            "7. 点击\"导出CSV\"把当前表格保存为Excel可打开的CSV文件。\n\n"
+            "8. 当前部落战视图每30秒自动刷新一次;\n"
             "   点\"暂停刷新\"可冻结当前数据,再点\"继续刷新\"恢复。\n\n"
             "注意: 令牌与IP绑定,换网络后需重新创建令牌。")
 
